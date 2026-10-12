@@ -1,0 +1,503 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Liquid Chrome Score</title>
+<style>
+  html, body { margin: 0; background: #0b0b0c; color: #d8d8d8; font: 14px/1.5 system-ui, sans-serif; }
+  main { max-width: 640px; margin: 48px auto; padding: 0 16px; }
+  button { font: inherit; padding: 8px 14px; margin-right: 8px; border-radius: 6px; border: 1px solid #444; background: #1b1b1d; color: inherit; cursor: pointer; }
+  pre { background: #141416; padding: 12px; border-radius: 6px; overflow-x: auto; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Liquid Chrome: score</h1>
+  <p>Everything is synthesised with the Web Audio API in an OfflineAudioContext: no samples, no downloads.
+     120 BPM, a 6 s loop of 360 frames at 60 fps. Each hit lands one frame after its visual event.</p>
+  <button id="play" disabled>Play loop</button><button id="save" disabled>Download WAV</button>
+  <pre id="log">rendering…</pre>
+</main>
+<script type="module">
+// ---------------------------------------------------------------------------
+// Timing
+// ---------------------------------------------------------------------------
+const SR = 48000, FPS = 60, LOOP = 6, FRAMES = LOOP * FPS;
+const LAND = 1;                                   // every hit and the bed land 1 frame after the visual
+const at = (pass, frame) => pass * LOOP + (frame + LAND) / FPS;
+
+// chords: F, B flat at 120, G minor at 240, C at 300
+const CHORDS = [
+  { frame: 0,   bass: 87.31,  pad: [174.61, 220.00, 261.63] },   // F
+  { frame: 120, bass: 116.54, pad: [233.08, 293.66, 349.23] },   // B flat
+  { frame: 240, bass: 98.00,  pad: [196.00, 233.08, 293.66] },   // G minor
+  { frame: 300, bass: 130.81, pad: [261.63, 329.63, 392.00] },   // C
+];
+
+// Liquid Chrome's visual events (frames), mapped from the A/B cue sheet
+const CUES = {
+  reverseSwell: [66, 84],   // blob winds up into the stretch
+  snap: 84,                 // blob snaps out 2.4x wide
+  pops: [108, 112],         // droplets pinch off
+  airLift: [112, 126],      // droplets arc up and overshoot
+  formSwell: [150, 171],    // droplets resolve into the logo; peak as the last glyph locks
+  shimmer: [198, 246],      // glint sweeps left to right across the faces
+  letGo: 288,               // the 6-frame swell
+  swish: [290, 318],        // slump and drain
+  whoosh: [318, 337],       // drain into the merge
+  shut: 337,                // blob reforms at 5.62 s
+  ticks: [350, 359],        // wobble bounces, running into frame 0
+};
+
+// Mix levels (linear). Hits are set 3 to 6 dB over the bed in the 200 Hz to 6 kHz band.
+const db = x => Math.pow(10, x / 20);
+const LV = {
+  kick: db(-12), knock: db(-13.5), shaker: db(-19), bassSaw: db(-21), bassSine: db(-21) / 3, pad: db(-13),
+  reverseSwell: db(-6), snapClick: db(-11), snapBody: db(-9.5), snapThump: db(-11),
+  pop: db(-8), airLift: db(-5), formSwell: db(-4), shimmer: db(-7), letGo: db(-8),
+  swish: db(-4), whoosh: db(-2), shutClick: db(-10), shutThock: db(-4.5), shutThump: db(-11),
+  tick1: db(-12), tick2: db(-10), duck: db(-4), reverb: db(-14),
+};
+
+// ---------------------------------------------------------------------------
+// Deterministic sources
+// ---------------------------------------------------------------------------
+function mulberry32(seed) {
+  return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+}
+function noiseBuffer(ctx, seconds, seed) {
+  const rnd = mulberry32(seed), n = Math.round(seconds * SR);
+  const b = ctx.createBuffer(1, n, SR), d = b.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = rnd() * 2 - 1;
+  return b;
+}
+// unit-energy room, mostly common to both channels so it folds down to mono cleanly
+function reverbIR(ctx) {
+  const n = Math.round(1.2 * SR), b = ctx.createBuffer(2, n, SR);
+  const tail = seed => {
+    const rnd = mulberry32(seed), d = new Float32Array(n);
+    let lp = 0;
+    for (let i = 0; i < n; i++) {
+      lp += 0.35 * ((rnd() * 2 - 1) - lp);                // darken the tail
+      d[i] = lp * Math.exp(-i / (0.32 * SR)) * Math.min(1, i / (0.004 * SR));
+    }
+    return d;
+  };
+  const common = tail(17);
+  for (let c = 0; c < 2; c++) {
+    const own = tail(29 + c), d = b.getChannelData(c);
+    for (let i = 0; i < n; i++) d[i] = 0.9 * common[i] + 0.3 * own[i];
+    const e = Math.sqrt(d.reduce((p, v) => p + v * v, 0));
+    for (let i = 0; i < n; i++) d[i] /= e;
+  }
+  return b;
+}
+
+// ---------------------------------------------------------------------------
+// Score
+// ---------------------------------------------------------------------------
+// parts: which stems to include ('kick', 'bed', 'hits'); renders two passes, keeps the second
+async function renderPass(parts) {
+  const ctx = new OfflineAudioContext({ numberOfChannels: 2, length: 2 * LOOP * SR, sampleRate: SR });
+  const noise = noiseBuffer(ctx, 2, 1234);
+  const cosWave = ctx.createPeriodicWave(new Float32Array([0, 1]), new Float32Array([0, 0]), { disableNormalization: true });
+
+  // master: nothing above 8 kHz
+  const master = ctx.createGain();
+  let node = master;
+  for (let i = 0; i < 2; i++) {
+    const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 7400; lp.Q.value = 0.7071;
+    node.connect(lp); node = lp;
+  }
+  node.connect(ctx.destination);
+  const verb = ctx.createConvolver(); verb.normalize = false; verb.buffer = reverbIR(ctx);
+  const verbIn = ctx.createGain(); verbIn.gain.value = LV.reverb;
+  const verbHp = ctx.createBiquadFilter(); verbHp.type = 'highpass'; verbHp.frequency.value = 250;
+  verbIn.connect(verbHp).connect(verb).connect(master);
+
+  const bed = ctx.createGain(); bed.connect(master);           // ducked under the shut
+  const hits = ctx.createGain(); hits.connect(master); hits.connect(verbIn);
+  const want = p => parts.includes(p);
+
+  // helpers ------------------------------------------------------------------
+  const out = (dest, pan = 0) => { if (!pan) return dest; const p = ctx.createStereoPanner(); p.pan.value = pan; p.connect(dest); return p; };
+  // cosine-phase tone: first waveform peak on t0 (0.5 ms attack), then a 3 ms transient
+  // (level falls to 65%) and an exponential decay, so the first peak is the largest.
+  // frequency.value is set as well as automated: an event at the start time is not applied
+  // to the oscillator's first samples.
+  function tone(dest, t0, freq, level, decay, { attack = 0.0005, len = decay * 7, toFreq, sweep = 0 } = {}) {
+    const o = ctx.createOscillator(); o.setPeriodicWave(cosWave);
+    o.frequency.value = freq; o.frequency.setValueAtTime(freq, t0);
+    if (toFreq) o.frequency.exponentialRampToValueAtTime(toFreq, t0 + sweep);
+    const g = ctx.createGain(); g.gain.setValueAtTime(0, t0);
+    g.gain.linearRampToValueAtTime(level, t0 + attack);
+    if (decay > 0.004) { g.gain.linearRampToValueAtTime(level * 0.65, t0 + 0.003); g.gain.setTargetAtTime(0, t0 + 0.003, decay); }
+    else g.gain.setTargetAtTime(0, t0 + attack, decay);
+    o.connect(g).connect(dest); o.start(t0); o.stop(t0 + attack + len);
+    return g;
+  }
+  function noiseSrc(t0, t1, offset = 0) {
+    const s = ctx.createBufferSource(); s.buffer = noise; s.loop = true;
+    s.start(t0, offset % 2); s.stop(t1); return s;
+  }
+  function click(dest, t0, level) {
+    const s = noiseSrc(t0, t0 + 0.004, t0 * 7.3);
+    const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 2200;
+    const g = ctx.createGain(); g.gain.setValueAtTime(0, t0);
+    g.gain.linearRampToValueAtTime(level, t0 + 0.0003); g.gain.setTargetAtTime(0, t0 + 0.0003, 0.0006);
+    s.connect(hp).connect(g).connect(dest);
+  }
+  // band-passed noise with automated centre and gain points [[t, freq, gain], ...]
+  function noiseSweep(dest, pts, q = 1.2, offset = 0) {
+    const t0 = pts[0][0], t1 = pts[pts.length - 1][0];
+    const s = noiseSrc(t0, t1 + 0.01, offset);
+    const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = q;
+    const g = ctx.createGain();
+    bp.frequency.setValueAtTime(pts[0][1], t0); g.gain.setValueAtTime(pts[0][2], t0);
+    for (const [t, f, a] of pts.slice(1)) {
+      bp.frequency.exponentialRampToValueAtTime(f, t);
+      if (a <= 1e-4) g.gain.linearRampToValueAtTime(0, t); else g.gain.exponentialRampToValueAtTime(a, t);
+    }
+    s.connect(bp).connect(g).connect(dest);
+    return g;
+  }
+
+  for (let pass = 0; pass < 2; pass++) {
+    const T = f => at(pass, f);
+
+    // ---- bed ---------------------------------------------------------------
+    if (want('kick')) {
+      // kick every 60 frames: 80 ms, 3 ms transient, 190 Hz knock; first peak is the largest
+      for (let f = 0; f < FRAMES; f += 60) {
+        const t0 = T(f);
+        const o = ctx.createOscillator(); o.setPeriodicWave(cosWave);
+        o.frequency.value = 150; o.frequency.setValueAtTime(150, t0); o.frequency.exponentialRampToValueAtTime(48, t0 + 0.06);
+        const g = ctx.createGain(); g.gain.setValueAtTime(0, t0);
+        g.gain.linearRampToValueAtTime(LV.kick, t0 + 0.0005);
+        g.gain.linearRampToValueAtTime(LV.kick * 0.65, t0 + 0.003);
+        g.gain.setTargetAtTime(0, t0 + 0.003, 0.016);
+        o.connect(g).connect(bed); o.start(t0); o.stop(t0 + 0.08);
+        tone(bed, t0, 190, LV.knock, 0.0013, { len: 0.004 });
+      }
+    }
+    if (want('bed')) {
+      // 16th shaker
+      for (let k = 0; k < 48; k++) {
+        const t0 = pass * LOOP + (k * 7.5 + LAND) / FPS;
+        const acc = [0.55, 0.3, 1.0, 0.35][k % 4];
+        const s = noiseSrc(t0, t0 + 0.06, k * 0.137);
+        const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 5600; bp.Q.value = 1.1;
+        const g = ctx.createGain(); g.gain.setValueAtTime(0, t0);
+        g.gain.linearRampToValueAtTime(LV.shaker * acc, t0 + 0.0015); g.gain.setTargetAtTime(0, t0 + 0.0015, 0.011);
+        s.connect(bp).connect(g).connect(out(bed, k % 2 ? 0.12 : -0.12));
+      }
+      // bass (8th pulses: saw opened to 1200 Hz, sine at a third) and pad (detuned saws, 1600 Hz)
+      CHORDS.forEach((c, i) => {
+        const t0 = T(c.frame), t1 = T(i + 1 < CHORDS.length ? CHORDS[i + 1].frame : FRAMES);
+        const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 1200; lp.Q.value = 0.9; lp.connect(bed);
+        const saw = ctx.createOscillator(); saw.type = 'sawtooth'; saw.frequency.value = c.bass;
+        const sin = ctx.createOscillator(); sin.frequency.value = c.bass;
+        const gs = ctx.createGain(), gn = ctx.createGain();
+        gs.gain.setValueAtTime(0, t0); gn.gain.setValueAtTime(0, t0);
+        for (let t = t0; t < t1 - 1e-6; t += 0.25) {
+          for (const [g, lvl] of [[gs, LV.bassSaw], [gn, LV.bassSine]]) {
+            g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(lvl, t + 0.006);
+            g.gain.setTargetAtTime(lvl * 0.55, t + 0.006, 0.06);
+            g.gain.setValueAtTime(lvl * 0.5, Math.min(t + 0.22, t1 - 0.012)); g.gain.linearRampToValueAtTime(0, Math.min(t + 0.245, t1 - 0.001));
+          }
+        }
+        saw.connect(gs).connect(lp); sin.connect(gn).connect(bed);
+        for (const o of [saw, sin]) { o.start(t0); o.stop(t1); }
+
+        const plp = ctx.createBiquadFilter(); plp.type = 'lowpass'; plp.frequency.value = 1600; plp.Q.value = 0.5;
+        const pg = ctx.createGain(); pg.gain.setValueAtTime(0, t0);
+        pg.gain.linearRampToValueAtTime(LV.pad, t0 + 0.08); pg.gain.setValueAtTime(LV.pad, t1 - 0.02); pg.gain.linearRampToValueAtTime(0, t1 + 0.15);
+        plp.connect(pg); pg.connect(bed); pg.connect(verbIn);
+        c.pad.forEach((f, v) => {
+          for (const [cents, pan] of [[-7, -0.3], [7, 0.3]]) {
+            const o = ctx.createOscillator(); o.type = 'sawtooth'; o.frequency.value = f; o.detune.value = cents + v;
+            const g = ctx.createGain(); g.gain.value = 0.33;
+            o.connect(g).connect(out(plp, pan)); o.start(t0); o.stop(t1 + 0.2);
+          }
+        });
+      });
+    }
+    // ---- hits ----------------------------------------------------------------
+    if (!want('hits')) continue;
+
+    // reverse swell into the snap
+    {
+      const [a, b] = CUES.reverseSwell.map(T);
+      noiseSweep(hits, [[a, 600, 1e-4], [b - 0.004, 3200, LV.reverseSwell], [b - 0.003, 3200, 1e-5]], 0.9, 0.3);
+      const o = ctx.createOscillator(); o.type = 'sawtooth'; o.frequency.value = 349.23;
+      const lp = ctx.createBiquadFilter(); lp.type = 'lowpass';
+      lp.frequency.setValueAtTime(500, a); lp.frequency.exponentialRampToValueAtTime(2600, b);
+      const g = ctx.createGain(); g.gain.setValueAtTime(1e-4, a);
+      g.gain.exponentialRampToValueAtTime(LV.reverseSwell * 0.5, b - 0.004); g.gain.linearRampToValueAtTime(0, b - 0.003);
+      o.connect(lp).connect(g).connect(hits); o.start(a); o.stop(b + 0.01);
+    }
+    // snap: click, 880 Hz body, 120 Hz thump
+    {
+      const t0 = T(CUES.snap);
+      click(hits, t0, LV.snapClick);
+      tone(hits, t0, 880, LV.snapBody, 0.05);
+      tone(hits, t0, 120, LV.snapThump, 0.04, { len: 0.18 });
+    }
+    // magnetic pops as the droplets pinch off
+    CUES.pops.forEach((f, i) => {
+      const t0 = T(f);
+      click(hits, t0, LV.pop * 0.5);
+      tone(out(hits, i ? 0.15 : -0.15), t0, 1250 + i * 260, LV.pop, 0.028, { toFreq: 520 + i * 120, sweep: 0.04, len: 0.12 });
+      tone(hits, t0, 330, LV.pop * 0.6, 0.03, { len: 0.12 });
+    });
+    // air lift as the droplets arc up
+    {
+      const [a, b] = CUES.airLift.map(T);
+      noiseSweep(hits, [[a, 900, 1e-4], [b - 0.04, 4600, LV.airLift], [b + 0.12, 5200, 1e-4]], 1.6, 0.9);
+    }
+    // form swell: clear peak, 60 ms exponential rise into frame 172, 25 ms drop into the tail
+    {
+      const a = T(CUES.formSwell[0]), p = T(CUES.formSwell[1]);
+      const g = ctx.createGain(); g.connect(hits);
+      g.gain.setValueAtTime(1e-4, a);
+      g.gain.exponentialRampToValueAtTime(LV.formSwell * 0.3, p - 0.06);
+      g.gain.exponentialRampToValueAtTime(LV.formSwell, p);
+      g.gain.exponentialRampToValueAtTime(LV.formSwell * 0.32, p + 0.025);
+      g.gain.setTargetAtTime(0, p + 0.025, 0.14);
+      const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 1.4;
+      lp.frequency.setValueAtTime(700, a); lp.frequency.exponentialRampToValueAtTime(4200, p); lp.frequency.exponentialRampToValueAtTime(1800, p + 0.3);
+      lp.connect(g);
+      for (const [f, d] of [[233.08, -5], [349.23, 5], [466.16, 0], [587.33, 3]]) {
+        const o = ctx.createOscillator(); o.type = 'sawtooth'; o.frequency.value = f; o.detune.value = d;
+        const og = ctx.createGain(); og.gain.value = 0.25; o.connect(og).connect(lp); o.start(a); o.stop(p + 1.0);
+      }
+      const ng = ctx.createGain(); ng.gain.value = 0.5; ng.connect(g);
+      noiseSweep(ng, [[a, 1500, 0.6], [p, 5000, 1], [p + 0.6, 3000, 1e-4]], 1.0, 1.3);
+    }
+    // glint shimmer, panned left to right with the sweep
+    {
+      const [a, b] = CUES.shimmer.map(T);
+      const pan = ctx.createStereoPanner(); pan.connect(hits);
+      pan.pan.setValueAtTime(-0.55, a); pan.pan.linearRampToValueAtTime(0.55, b);
+      const g = ctx.createGain(); g.connect(pan);
+      g.gain.setValueAtTime(0, a); g.gain.linearRampToValueAtTime(LV.shimmer, a + 0.07);
+      g.gain.setValueAtTime(LV.shimmer, b - 0.12); g.gain.linearRampToValueAtTime(0, b);
+      [2093.0, 2637.0, 3136.0, 3951.1, 4698.6, 5274.0].forEach((f, i) => {
+        const o = ctx.createOscillator(); o.frequency.value = f;
+        const og = ctx.createGain(); og.gain.value = 0.18 / (1 + i * 0.25);
+        const lfo = ctx.createOscillator(); lfo.frequency.value = 7 + i * 2.3;
+        const lg = ctx.createGain(); lg.gain.value = 0.14 / (1 + i * 0.25);
+        lfo.connect(lg).connect(og.gain);
+        o.connect(og).connect(g);
+        for (const x of [o, lfo]) { x.start(a); x.stop(b + 0.01); }
+      });
+      const ng = ctx.createGain(); ng.gain.value = 0.35; ng.connect(g);
+      noiseSweep(ng, [[a, 3500, 1], [b, 6500, 1]], 4, 0.2);
+    }
+    // let-go click on the swell, then the falling swish, the whoosh and the shut
+    {
+      const t0 = T(CUES.letGo);
+      click(hits, t0, LV.letGo * 0.8);
+      tone(hits, t0, 1480, LV.letGo, 0.035, { len: 0.15 });
+      tone(hits, t0, 420, LV.letGo * 0.7, 0.04, { len: 0.16 });
+    }
+    {
+      const [a, b] = CUES.swish.map(T);
+      noiseSweep(hits, [[a, 3400, 1e-4], [a + 0.12, 2400, LV.swish], [b, 420, 1e-4]], 1.1, 0.55);
+    }
+    {
+      const [a, b] = CUES.whoosh.map(T);
+      noiseSweep(hits, [[a, 380, 1e-4], [b - 0.03, 2400, LV.whoosh], [b, 2600, LV.whoosh * 0.3], [b + 0.004, 2600, 1e-5]], 0.9, 1.7);
+      const t0 = T(CUES.shut);
+      click(hits, t0, LV.shutClick);
+      tone(hits, t0, 200, LV.shutThock, 0.06, { len: 0.3 });
+      tone(hits, t0, 70, LV.shutThump, 0.07, { len: 0.4 });
+    }
+    // wobble ticks: bodies decay inside 12 ms
+    CUES.ticks.forEach((f, i) => {
+      const t0 = T(f), lvl = i ? LV.tick2 : LV.tick1;
+      click(hits, t0, lvl * 0.7);
+      tone(hits, t0, 1900, lvl, 0.003, { len: 0.012 });
+      tone(hits, t0, 640, lvl * 0.8, 0.003, { len: 0.012 });
+    });
+  }
+
+  // duck the bed 4 dB from the shut through tick 2 (frames 338 to 13, across the loop point)
+  if (want('kick') || want('bed')) {
+    const end = (13 + LAND) / FPS;
+    for (const [a, b] of [[0, end], [at(0, CUES.shut), LOOP + end], [at(1, CUES.shut), 2 * LOOP]]) {
+      bed.gain.setValueAtTime(1, Math.max(0, a - 0.004)); bed.gain.linearRampToValueAtTime(LV.duck, a);
+      bed.gain.setValueAtTime(LV.duck, b - 0.03); bed.gain.linearRampToValueAtTime(1, b);
+    }
+  }
+
+  const buf = await ctx.startRendering();
+  // keep the second pass
+  return [0, 1].map(c => buf.getChannelData(c).slice(LOOP * SR, 2 * LOOP * SR));
+}
+
+// ---------------------------------------------------------------------------
+// Mastering: DC removal, -14 LUFS, true-peak limiter at -2.2 dBTP (the AAC encode lifts peaks)
+// ---------------------------------------------------------------------------
+const TARGET_LUFS = -14, CEILING_DBTP = -2.2;
+
+function biquad(x, b, a) {
+  const y = new Float64Array(x.length);
+  let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+  for (let i = 0; i < x.length; i++) {
+    const v = b[0] * x[i] + b[1] * x1 + b[2] * x2 - a[1] * y1 - a[2] * y2;
+    x2 = x1; x1 = x[i]; y2 = y1; y1 = v; y[i] = v;
+  }
+  return y;
+}
+// BS.1770 integrated loudness of a loop (measured over the loop played twice)
+function lufs(ch) {
+  const kw = x => biquad(biquad(x, [1.53512485958697, -2.69169618940638, 1.19839281085285], [1, -1.69065929318241, 0.73248077421585]),
+                          [1, -2, 1], [1, -1.99004745483398, 0.99007225036621]);
+  const z = ch.map(x => { const d = new Float64Array(x.length * 2); d.set(x); d.set(x, x.length); return kw(d); });
+  const block = Math.round(0.4 * SR), hop = Math.round(0.1 * SR), ms = [];
+  for (let s = 0; s + block <= z[0].length; s += hop) {
+    let sum = 0;
+    for (const zc of z) for (let i = s; i < s + block; i++) sum += zc[i] * zc[i];
+    ms.push(sum / block);
+  }
+  const L = m => -0.691 + 10 * Math.log10(m);
+  const abs = ms.filter(m => L(m) > -70);
+  const rel = L(abs.reduce((p, m) => p + m, 0) / abs.length) - 10;
+  const g = abs.filter(m => L(m) > rel);
+  return L(g.reduce((p, m) => p + m, 0) / g.length);
+}
+// 4x oversampled true peak per sample (windowed sinc), circular
+const TP_TAPS = (() => {
+  const taps = [];
+  for (let ph = 1; ph < 4; ph++) {
+    const k = [];
+    for (let j = -12; j < 12; j++) {
+      const x = j + 1 - ph / 4, w = 0.5 + 0.5 * Math.cos(Math.PI * x / 12.5);
+      k.push(x === 0 ? 1 : Math.sin(Math.PI * x) / (Math.PI * x) * w);
+    }
+    taps.push(k);
+  }
+  return taps;
+})();
+function truePeakEnvelope(x) {
+  const n = x.length, env = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    let m = Math.abs(x[i]);
+    for (const k of TP_TAPS) {
+      let v = 0;
+      for (let j = 0; j < 24; j++) v += k[j] * x[(i - 12 + j + 1 + n) % n];
+      m = Math.max(m, Math.abs(v));
+    }
+    env[i] = m;
+  }
+  return env;
+}
+// lookahead limiter, processed circularly so the loop stays seamless
+function limiterGain(ch, ceiling) {
+  const n = ch[0].length, envs = ch.map(truePeakEnvelope);
+  const need = new Float64Array(n);
+  for (let i = 0; i < n; i++) need[i] = Math.min(1, ceiling / Math.max(1e-9, envs[0][i], envs[1][i]));
+  const L = Math.round(0.005 * SR), rel = Math.exp(-1 / (0.08 * SR));
+  const minf = new Float64Array(n);
+  for (let i = 0; i < n; i++) { let m = 1; for (let j = 0; j <= 2 * L; j++) m = Math.min(m, need[(i - L + j + n) % n]); minf[i] = m; }
+  const g = new Float64Array(n);
+  let s = 1;
+  for (let pass = 0; pass < 2; pass++) for (let i = 0; i < n; i++) { s = Math.min(minf[i], 1 - (1 - s) * rel); g[i] = s; }
+  // short smoothing that never rises above the requirement
+  const out = new Float64Array(n);
+  for (let i = 0; i < n; i++) { let m = 0; for (let j = -L; j <= L; j++) m += g[(i + j + n) % n]; out[i] = Math.min(g[i], m / (2 * L + 1)); }
+  return out;
+}
+
+// zero-phase FIR low-pass (511 taps, Blackman): nothing above 8 kHz, hit timing untouched
+const FIR = (() => {
+  const N = 511, fc = 7550 / SR, h = new Float64Array(N);
+  let sum = 0;
+  for (let i = 0; i < N; i++) {
+    const m = i - (N - 1) / 2, w = 0.42 - 0.5 * Math.cos(2 * Math.PI * i / (N - 1)) + 0.08 * Math.cos(4 * Math.PI * i / (N - 1));
+    h[i] = (m === 0 ? 2 * fc : Math.sin(2 * Math.PI * fc * m) / (Math.PI * m)) * w; sum += h[i];
+  }
+  return h.map(v => v / sum);
+})();
+function lowpass8k(x) {
+  const n = x.length, N = FIR.length, c = (N - 1) / 2, y = new Float64Array(n);
+  for (let i = 0; i < n; i++) { let v = 0; for (let j = 0; j < N; j++) v += FIR[j] * x[(i + j - c + n) % n]; y[i] = v; }
+  return y;
+}
+
+function master(full, stems) {
+  const ceiling = Math.pow(10, CEILING_DBTP / 20);
+  full = full.map(lowpass8k); stems = Object.fromEntries(Object.entries(stems).map(([k, v]) => [k, v.map(lowpass8k)]));
+  // remove DC: subtract each channel's loop mean
+  const dc = x => { const m = x.reduce((p, v) => p + v, 0) / x.length; return Float64Array.from(x, v => v - m); };
+  full = full.map(dc); stems = Object.fromEntries(Object.entries(stems).map(([k, v]) => [k, v.map(dc)]));
+  let gain = Math.pow(10, (TARGET_LUFS - lufs(full)) / 20), lim = null, loud = 0;
+  for (let it = 0; it < 6; it++) {
+    const pre = full.map(x => Float64Array.from(x, v => v * gain));
+    lim = limiterGain(pre, ceiling * 0.985);
+    loud = lufs(pre.map(x => x.map((v, i) => v * lim[i])));
+    if (Math.abs(loud - TARGET_LUFS) < 0.03) break;
+    gain *= Math.pow(10, (TARGET_LUFS - loud) / 20);
+  }
+  const apply = ch => ch.map(x => Float32Array.from(x, (v, i) => v * gain * lim[i]));
+  const out = apply(full);
+  const tp = Math.max(...out.map(x => truePeakEnvelope(Float64Array.from(x)).reduce((m, v) => Math.max(m, v), 0)));
+  let maxGr = 0; for (const v of lim) maxGr = Math.max(maxGr, -20 * Math.log10(v));
+  // where the limiter works hardest, by frame
+  const grFrames = {};
+  lim.forEach((v, i) => { const gr = -20 * Math.log10(v), f = Math.floor(i / SR * FPS); if (gr > 1) grFrames[f] = Math.max(grFrames[f] || 0, +gr.toFixed(1)); });
+  return {
+    out, stems: Object.fromEntries(Object.entries(stems).map(([k, v]) => [k, apply(v)])),
+    stats: { lufs: +lufs(out.map(x => Float64Array.from(x))).toFixed(2), truePeakDbtp: +(20 * Math.log10(tp)).toFixed(2),
+             makeupDb: +(20 * Math.log10(gain)).toFixed(2), maxLimiterDb: +maxGr.toFixed(2), limiterOver1dbByFrame: grFrames },
+  };
+}
+
+// 48 kHz stereo 24-bit WAV
+function wav(ch) {
+  const n = ch[0].length, bytes = new ArrayBuffer(44 + n * 6), v = new DataView(bytes);
+  const s = (o, t) => [...t].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+  s(0, 'RIFF'); v.setUint32(4, 36 + n * 6, true); s(8, 'WAVEfmt '); v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true); v.setUint16(22, 2, true); v.setUint32(24, SR, true); v.setUint32(28, SR * 6, true);
+  v.setUint16(32, 6, true); v.setUint16(34, 24, true); s(36, 'data'); v.setUint32(40, n * 6, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) for (const c of ch) {
+    const q = Math.max(-8388608, Math.min(8388607, Math.round(c[i] * 8388607)));
+    v.setUint8(o++, q & 255); v.setUint8(o++, (q >> 8) & 255); v.setUint8(o++, (q >> 16) & 255);
+  }
+  return new Uint8Array(bytes);
+}
+
+// ---------------------------------------------------------------------------
+async function renderScore() {
+  const [full, bed, hits, kick] = await Promise.all([
+    renderPass(['kick', 'bed', 'hits']), renderPass(['kick', 'bed']), renderPass(['hits']), renderPass(['kick']),
+  ]);
+  const m = master(full, { bed, hits, kick });
+  return { ...m, wav: wav(m.out), cues: CUES, land: LAND, fps: FPS, sampleRate: SR };
+}
+window.renderScore = renderScore;
+
+const result = await renderScore();
+window.__score = result;
+document.getElementById('log').textContent = JSON.stringify(result.stats, null, 2);
+const blob = new Blob([result.wav], { type: 'audio/wav' });
+const url = URL.createObjectURL(blob);
+document.getElementById('save').disabled = false;
+document.getElementById('save').onclick = () => { const a = document.createElement('a'); a.href = url; a.download = 'liquid-chrome.wav'; a.click(); };
+let ac = null, src = null;
+document.getElementById('play').disabled = false;
+document.getElementById('play').onclick = async () => {
+  if (src) { src.stop(); src = null; return; }
+  ac = ac || new AudioContext({ sampleRate: SR });
+  const b = ac.createBuffer(2, result.out[0].length, SR);
+  result.out.forEach((c, i) => b.copyToChannel(c, i));
+  src = ac.createBufferSource(); src.buffer = b; src.loop = true; src.connect(ac.destination); src.start();
+};
+window.__ready = true;
+</script>
+</body>
+</html>
