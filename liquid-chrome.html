@@ -327,13 +327,13 @@ vec3 env(vec3 d, float blurDeg){
   vec2 ae = vec2(az, el);
   float s = (0.6 + blurDeg) * DEG;
 
-  // white cyclorama behind the set, dim studio on the sides
+  // dark cyclorama behind the set, dim studio on the sides
   float back = smoothstep(70.0 * DEG, 130.0 * DEG, abs(az));
-  float cyc = mix(0.80, 0.14, smoothstep(0.0, 38.0 * DEG, el));
+  float cyc = mix(0.009, 0.002, smoothstep(0.0, 30.0 * DEG, el));
   float side = mix(0.26, 0.07, smoothstep(-10.0 * DEG, 55.0 * DEG, el));
   vec3 c = vec3(mix(side, cyc, back));
   // below the horizon (only reached as a fallback): floor, silver card on the camera side
-  c = mix(c, d.z > 0.0 ? silverCard(d) : vec3(0.78), smoothstep(0.0, -3.0 * DEG, el));
+  c = mix(c, d.z > 0.0 ? silverCard(d) : vec3(0.008), smoothstep(0.0, -3.0 * DEG, el));
 
   // overhead softbox, 2.4
   if (d.y > 0.05){
@@ -354,7 +354,7 @@ vec3 env(vec3 d, float blurDeg){
   return c;
 }
 
-// ---- floor: white, soft overhead shadow, contact darkening, black beyond z 4 ----
+// ---- floor: dark, a soft pool of light under the set, soft overhead shadow, contact darkening, black beyond z 4 ----
 vec3 floorDirect(vec3 p){
   float r = length(p.xz);
   float sh = 1.0, ao = 1.0;
@@ -362,7 +362,7 @@ vec3 floorDirect(vec3 p){
     sh = softShadow(p + vec3(0.0, 0.002, 0.0), normalize(vec3(0.0, 1.0, -0.12)));
     ao = contactAO(p);
   }
-  float pool = mix(0.80, 0.755, smoothstep(1.5, 14.0, r));
+  float pool = mix(0.040, 0.0085, smoothstep(0.3, 5.0, r));
   vec3 c = vec3(pool * mix(0.42, 1.0, sh) * ao);
   return c * (1.0 - smoothstep(3.9, 4.1, p.z));
 }
