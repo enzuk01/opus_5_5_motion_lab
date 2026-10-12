@@ -1,0 +1,1004 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Liquid Chrome</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; }
+  body { display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  canvas { display: block; width: min(1080px, 100vw, 100vh); height: min(1080px, 100vw, 100vh); }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<canvas id="c" width="1080" height="1080"></canvas>
+<script type="module">
+import * as THREE from 'three';
+import { FontLoader } from 'three/addons/loaders/FontLoader.js';
+import { TextGeometry } from 'three/addons/geometries/TextGeometry.js';
+import { toCreasedNormals, mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+const W = 1080, H = 1080;
+const LOOP = 6;             // seconds; every motion and noise term is periodic in this
+const FPS = 60;
+const FONT_URL = 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/fonts/helvetiker_bold.typeface.json';
+const TEXT = 'OPUS 5.5';
+const SIZE = 0.52, HEIGHT = 0.12, BEVEL = 0.03, BEVEL_SEGS = 10, CURVE_SEGS = 24;
+const TRACKING = -0.04 * SIZE;
+const CREASE = 35 * Math.PI / 180;
+const BAKE_W = 2048, BAKE_H = 512;
+const GLYPH_MARGIN = 0.16;  // text-space region around each glyph sampled from the bake
+const NG = 7;               // glyphs (and droplets) in "OPUS 5.5"
+const BLOB_R = 0.62;
+const FLOOR_Y = -0.8;
+const FOV = 30, ELEV = 6 * Math.PI / 180, ORBIT = 7 * Math.PI / 180;
+const TARGET = new THREE.Vector3(0, -0.1, 0);
+// quarter-pixel jitter, picked by frac(t*60)
+const JITTER = [[-0.25, -0.25], [0.25, -0.25], [-0.25, 0.25], [0.25, 0.25]];
+
+// ---------------------------------------------------------------------------
+// Easing helpers
+// ---------------------------------------------------------------------------
+const clamp01 = x => Math.min(1, Math.max(0, x));
+const mod = (a, n) => ((a % n) + n) % n;
+const lerp = (a, b, t) => a + (b - a) * t;
+const sstep = (a, b, x) => { const t = clamp01((x - a) / (b - a)); return t * t * (3 - 2 * t); };
+const s5step = (a, b, x) => { const t = clamp01((x - a) / (b - a)); return t * t * t * (t * (t * 6 - 15) + 10); };
+const easeOut3 = x => 1 - Math.pow(1 - clamp01(x), 3);
+
+// back-out easing whose peak overshoot is exactly 7%
+const backOut = (x, c) => { const u = x - 1; return 1 + (c + 1) * u * u * u + c * u * u; };
+const BACK_C = (() => {
+  const peak = c => { let m = 0; for (let i = 0; i <= 400; i++) m = Math.max(m, backOut(i / 400, c)); return m; };
+  let lo = 0, hi = 3;
+  for (let i = 0; i < 40; i++) { const mid = (lo + hi) / 2; if (peak(mid) > 1.07) hi = mid; else lo = mid; }
+  return (lo + hi) / 2;
+})();
+
+// ---------------------------------------------------------------------------
+// GLSL
+// ---------------------------------------------------------------------------
+const GLSL_COMMON = /* glsl */`
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+
+#define NG ${NG}
+#define FLOOR_Y ${FLOOR_Y.toFixed(3)}
+#define MARGIN ${GLYPH_MARGIN.toFixed(3)}
+#define DEG 0.0174532925
+#define HALF_DEPTH ${(HEIGHT / 2).toFixed(4)}
+
+uniform sampler2D uSdfTex;
+uniform vec2 uTexMin, uTexSize;
+uniform vec4 uGlyphBox[NG];
+uniform float uGlyphChan[NG];
+uniform vec3 uDropC[NG];
+uniform vec3 uDropAxis[NG];
+uniform vec2 uDropR[NG];
+uniform float uK[NG];
+uniform float uBev[NG];
+uniform float uSmk[NG];
+uniform float uInfl;
+uniform float uSlump;
+uniform vec3 uBlobC;
+uniform vec3 uBlobR;
+uniform float uNoiseAmp;
+uniform vec2 uNoiseOfs;
+uniform float uGlintAz;
+uniform float uGlintAmt;
+
+const vec3 BMIN = vec3(-2.2, -0.8, -0.9);
+const vec3 BMAX = vec3( 2.2,  1.2,  0.9);
+const vec3 RIM = vec3(0.6939, 0.1845, 0.0953);   // #D97757, linear
+const float F0 = 0.92;
+const float ROUGH_BLUR = 1.4;                    // degrees of env blur per bounce (roughness 0.04)
+
+// ---- simplex noise 3D (Ashima Arts / Stefan Gustavson, MIT) ----
+vec3 mod289(vec3 x){ return x - floor(x * (1.0 / 289.0)) * 289.0; }
+vec4 mod289(vec4 x){ return x - floor(x * (1.0 / 289.0)) * 289.0; }
+vec4 permute(vec4 x){ return mod289(((x * 34.0) + 10.0) * x); }
+vec4 taylorInvSqrt(vec4 r){ return 1.79284291400159 - 0.85373472095314 * r; }
+float snoise(vec3 v){
+  const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+  const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+  vec3 i = floor(v + dot(v, C.yyy));
+  vec3 x0 = v - i + dot(i, C.xxx);
+  vec3 g = step(x0.yzx, x0.xyz);
+  vec3 l = 1.0 - g;
+  vec3 i1 = min(g.xyz, l.zxy);
+  vec3 i2 = max(g.xyz, l.zxy);
+  vec3 x1 = x0 - i1 + C.xxx;
+  vec3 x2 = x0 - i2 + C.yyy;
+  vec3 x3 = x0 - D.yyy;
+  i = mod289(i);
+  vec4 p = permute(permute(permute(i.z + vec4(0.0, i1.z, i2.z, 1.0)) + i.y + vec4(0.0, i1.y, i2.y, 1.0)) + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+  float n_ = 0.142857142857;
+  vec3 ns = n_ * D.wyz - D.xzx;
+  vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+  vec4 x_ = floor(j * ns.z);
+  vec4 y_ = floor(j - 7.0 * x_);
+  vec4 x = x_ * ns.x + ns.yyyy;
+  vec4 y = y_ * ns.x + ns.yyyy;
+  vec4 h = 1.0 - abs(x) - abs(y);
+  vec4 b0 = vec4(x.xy, y.xy);
+  vec4 b1 = vec4(x.zw, y.zw);
+  vec4 s0 = floor(b0) * 2.0 + 1.0;
+  vec4 s1 = floor(b1) * 2.0 + 1.0;
+  vec4 sh = -step(h, vec4(0.0));
+  vec4 a0 = b0.xzyw + s0.xzyw * sh.xxyy;
+  vec4 a1 = b1.xzyw + s1.xzyw * sh.zzww;
+  vec3 p0 = vec3(a0.xy, h.x);
+  vec3 p1 = vec3(a0.zw, h.y);
+  vec3 p2 = vec3(a1.xy, h.z);
+  vec3 p3 = vec3(a1.zw, h.w);
+  vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
+  p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+  vec4 m = max(0.5 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+  m = m * m;
+  return 105.0 * dot(m * m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+}
+
+// ---- SDF primitives ----
+float smin(float a, float b, float k){
+  if (k < 1e-4) return min(a, b);
+  float h = max(k - abs(a - b), 0.0) / k;
+  return min(a, b) - h * h * k * 0.25;
+}
+float sdEllipsoid(vec3 p, vec3 r){
+  float k0 = length(p / r);
+  float k1 = max(length(p / (r * r)), 1e-6);
+  return k0 * (k0 - 1.0) / k1;
+}
+// ellipsoid of revolution about uDropAxis[i]
+float sdDrop(int i, vec3 p){
+  vec3 q = p - uDropC[i];
+  vec3 ax = uDropAxis[i];
+  float a = dot(q, ax);
+  vec2 e = vec2(a, length(q - a * ax));
+  vec2 r = uDropR[i];
+  float k0 = length(e / r);
+  float k1 = max(length(e / (r * r)), 1e-6);
+  return k0 * (k0 - 1.0) / k1;
+}
+
+// cubic B-spline sampling from four bilinear taps: C2 distance, smooth chrome normals
+vec4 texCubic(sampler2D t, vec2 uv){
+  vec2 ts = vec2(textureSize(t, 0));
+  vec2 st = uv * ts - 0.5;
+  vec2 i = floor(st);
+  vec2 f = st - i;
+  vec2 f2 = f * f, f3 = f2 * f;
+  vec2 w0 = (1.0/6.0) * (-f3 + 3.0*f2 - 3.0*f + 1.0);
+  vec2 w1 = (1.0/6.0) * (3.0*f3 - 6.0*f2 + 4.0);
+  vec2 w2 = (1.0/6.0) * (-3.0*f3 + 3.0*f2 + 3.0*f + 1.0);
+  vec2 w3 = (1.0/6.0) * f3;
+  vec2 g0 = w0 + w1, g1 = w2 + w3;
+  vec2 h0 = (i - 1.0 + w1 / g0 + 0.5) / ts;
+  vec2 h1 = (i + 1.0 + w3 / g1 + 0.5) / ts;
+  vec4 a = texture(t, vec2(h0.x, h0.y));
+  vec4 b = texture(t, vec2(h1.x, h0.y));
+  vec4 c = texture(t, vec2(h0.x, h1.y));
+  vec4 d = texture(t, vec2(h1.x, h1.y));
+  return g0.y * (g0.x * a + g1.x * b) + g1.y * (g0.x * c + g1.x * d);
+}
+
+// 2D signed distance to glyph i (text space), from the baked texture.
+// Adjacent glyphs live in different channels (i % 3) so each one is isolated.
+float glyph2D(int i, vec2 q, bool hq){
+  vec4 b = uGlyphBox[i];
+  vec2 c = clamp(q, b.xy - MARGIN, b.zw + MARGIN);
+  vec2 uv = (c - uTexMin) / uTexSize;
+  vec4 s = hq ? texCubic(uSdfTex, uv) : texture(uSdfTex, uv);
+  float ch = uGlyphChan[i];
+  float d = ch < 0.5 ? s.r : (ch < 1.5 ? s.g : s.b);
+  return d + length(q - c);
+}
+
+// glyph outline extruded as a rounded box: core slab +/-HALF_DEPTH, offset by the bevel
+float sdGlyph(int i, vec3 p, bool hq){
+  float off = uBev[i] + uInfl;
+  vec4 b = uGlyphBox[i];
+  vec3 dq = abs(vec3(p.xy - 0.5 * (b.xy + b.zw), p.z)) - vec3(0.5 * (b.zw - b.xy), HALF_DEPTH);
+  float bound = length(max(dq, 0.0)) - off;
+  if (bound > 0.2) return bound;
+  vec2 w = vec2(glyph2D(i, p.xy, hq), abs(p.z) - HALF_DEPTH);
+  return min(max(w.x, w.y), 0.0) + length(max(w, 0.0)) - off;
+}
+
+float map(vec3 p, bool hq){
+  float d = 1e5;
+  if (uBlobR.x > 1e-4){
+    vec3 q = p - uBlobC;
+    d = sdEllipsoid(q, uBlobR);
+    if (uNoiseAmp > 0.0 && d < 0.3) d += uNoiseAmp * snoise(q * 1.25 + vec3(uNoiseOfs, 0.0));
+  }
+  vec3 pg = p + vec3(0.0, uSlump, 0.0);
+  for (int i = 0; i < NG; i++){
+    float K = uK[i];
+    bool hasDrop = uDropR[i].y > 1e-4 && K < 0.999;
+    if (!hasDrop && K < 0.001) continue;
+    float dd = hasDrop ? sdDrop(i, p) : 1e5;
+    if (K > 0.001){
+      float dg = sdGlyph(i, pg, hq);
+      dd = hasDrop ? mix(dd, dg, K) : dg;
+    }
+    d = smin(d, dd, uSmk[i]);
+  }
+  return d;
+}
+
+vec3 calcNormal(vec3 p){
+  const float e = 0.0012;
+  const vec2 k = vec2(1.0, -1.0);
+  return normalize(k.xyy * map(p + k.xyy * e, true) + k.yyx * map(p + k.yyx * e, true) +
+                   k.yxy * map(p + k.yxy * e, true) + k.xxx * map(p + k.xxx * e, true));
+}
+
+bool boxRange(vec3 ro, vec3 rd, out float t0, out float t1){
+  vec3 inv = 1.0 / (rd + vec3(equal(rd, vec3(0.0))) * 1e-7);
+  vec3 a = (BMIN - ro) * inv, b = (BMAX - ro) * inv;
+  vec3 tn = min(a, b), tx = max(a, b);
+  t0 = max(max(tn.x, tn.y), max(tn.z, 0.0));
+  t1 = min(min(tx.x, tx.y), tx.z);
+  return t1 > t0;
+}
+
+bool marchObj(vec3 ro, vec3 rd, float tmax, out float tHit){
+  float t, t1;
+  tHit = 1e9;
+  if (!boxRange(ro, rd, t, t1)) return false;
+  t1 = min(t1, tmax);
+  for (int i = 0; i < 180; i++){
+    if (t > t1) return false;
+    float d = map(ro + rd * t, false);
+    if (d < 0.0004 + 0.0003 * t){ tHit = t; return true; }
+    t += d * 0.85;
+  }
+  return false;
+}
+
+// soft shadow towards the overhead softbox
+float softShadow(vec3 ro, vec3 rd){
+  float t, t1;
+  if (!boxRange(ro, rd, t, t1)) return 1.0;
+  t = max(t, 0.02);
+  float res = 1.0;
+  for (int i = 0; i < 48; i++){
+    if (t > t1) break;
+    float h = map(ro + rd * t, false);
+    res = min(res, 4.0 * h / t);
+    if (res < 0.002) break;
+    t += clamp(h, 0.015, 0.2);
+  }
+  res = clamp(res, 0.0, 1.0);
+  return res * res * (3.0 - 2.0 * res);
+}
+
+// contact darkening on the floor
+float contactAO(vec3 p){
+  float occ = 0.0, sca = 1.0;
+  for (int i = 0; i < 6; i++){
+    float h = 0.02 + 0.1 * float(i);
+    float d = map(p + vec3(0.0, h, 0.0), false);
+    occ += (h - d) * sca;
+    sca *= 0.72;
+  }
+  return clamp(1.0 - 1.1 * occ, 0.0, 1.0);
+}
+
+// ---- studio environment: azimuth/elevation with the camera at azimuth 0 ----
+float wrapPi(float a){ return a - 6.2831853 * floor((a + 3.1415927) / 6.2831853); }
+float rectAE(vec2 ae, vec2 c, vec2 h, float s){
+  vec2 q = abs(vec2(wrapPi(ae.x - c.x), ae.y - c.y)) - h;
+  return 1.0 - smoothstep(-s, s, max(q.x, q.y));
+}
+// 2 degree glint strip, intensity 6, tilted 40 degrees, sweeping left to right.
+// Centred just below the horizon, where the letter faces reflect.
+float glint(float az, float el, float s){
+  if (uGlintAmt <= 0.0) return 0.0;
+  float ca = cos(40.0 * DEG), sa = sin(40.0 * DEG);
+  vec2 r = vec2(wrapPi(az - uGlintAz), el + 5.0 * DEG);
+  float across = r.x * ca - r.y * sa;
+  float along = r.x * sa + r.y * ca;
+  float m = 1.0 - smoothstep(1.0 * DEG - s, 1.0 * DEG + s, abs(across));
+  m *= 1.0 - smoothstep(32.0 * DEG, 44.0 * DEG, abs(along));
+  return 6.0 * uGlintAmt * m;
+}
+vec3 glintDir(vec3 d, float blurDeg){
+  return vec3(glint(atan(d.x, d.z), asin(clamp(d.y, -1.0, 1.0)), (0.3 + 0.25 * blurDeg) * DEG));
+}
+vec3 env(vec3 d, float blurDeg){
+  float el = asin(clamp(d.y, -1.0, 1.0));
+  float az = atan(d.x, d.z);
+  vec2 ae = vec2(az, el);
+  float s = (0.6 + blurDeg) * DEG;
+
+  // white cyclorama behind the set, dim studio on the sides
+  float back = smoothstep(70.0 * DEG, 130.0 * DEG, abs(az));
+  float cyc = mix(0.80, 0.14, smoothstep(0.0, 38.0 * DEG, el));
+  float side = mix(0.26, 0.07, smoothstep(-10.0 * DEG, 55.0 * DEG, el));
+  vec3 c = vec3(mix(side, cyc, back));
+  // below the horizon (only reached as a fallback): floor, black on the camera side
+  c = mix(c, vec3(d.z > 0.0 ? 0.0 : 0.78), smoothstep(0.0, -3.0 * DEG, el));
+
+  // overhead softbox, 2.4
+  if (d.y > 0.05){
+    vec2 q = abs(d.xz / d.y - vec2(0.0, -0.12)) - vec2(0.55, 0.32);
+    float sm = s * 1.5 / d.y;
+    c = mix(c, vec3(2.4), 1.0 - smoothstep(-sm, sm, max(q.x, q.y)));
+  }
+  // upper-left softbox, 3.0
+  c = mix(c, vec3(3.0), rectAE(ae, vec2(-48.0 * DEG, 36.0 * DEG), vec2(12.0 * DEG, 16.0 * DEG), s));
+  // black flags at 75 degrees left and right
+  c *= 1.0 - rectAE(ae, vec2( 75.0 * DEG, 20.0 * DEG), vec2(9.0 * DEG, 36.0 * DEG), s);
+  c *= 1.0 - rectAE(ae, vec2(-75.0 * DEG, 20.0 * DEG), vec2(9.0 * DEG, 36.0 * DEG), s);
+  // black camera-side panel, 86 x 57 degrees
+  c *= 1.0 - rectAE(ae, vec2(0.0), vec2(43.0 * DEG, 28.5 * DEG), s);
+  // terracotta rim strip behind, 149 degrees, 24 up
+  c += RIM * 1.4 * rectAE(ae, vec2(149.0 * DEG, 24.0 * DEG), vec2(2.5 * DEG, 18.0 * DEG), s);
+  c += glint(az, el, (0.3 + 0.25 * blurDeg) * DEG);
+  return c;
+}
+
+// ---- floor: white, soft overhead shadow, contact darkening, black beyond z 4 ----
+vec3 floorDirect(vec3 p){
+  float r = length(p.xz);
+  float sh = 1.0, ao = 1.0;
+  if (r < 4.5){
+    sh = softShadow(p + vec3(0.0, 0.002, 0.0), normalize(vec3(0.0, 1.0, -0.12)));
+    ao = contactAO(p);
+  }
+  float pool = mix(0.80, 0.755, smoothstep(1.5, 14.0, r));
+  vec3 c = vec3(pool * mix(0.42, 1.0, sh) * ao);
+  return c * (1.0 - smoothstep(3.9, 4.1, p.z));
+}
+
+// kind: 0 miss, 1 chrome, 2 floor
+int traceScene(vec3 ro, vec3 rd, out vec3 hp){
+  float tf = rd.y < -1e-5 ? (FLOOR_Y - ro.y) / rd.y : 1e9;
+  float th;
+  if (marchObj(ro, rd, min(tf, 60.0), th)){ hp = ro + rd * th; return 1; }
+  if (tf < 1e8 && tf > 0.0){ hp = ro + rd * tf; return 2; }
+  hp = ro + rd * 100.0;
+  return 0;
+}
+
+// chrome: F0 0.92, Schlick fresnel, up to three reflection bounces into the SDF scene
+vec3 shadeChrome(vec3 p, vec3 n, vec3 rd, int maxB){
+  vec3 acc = vec3(0.0);
+  float thr = 1.0;
+  float blur = ROUGH_BLUR;
+  for (int b = 0; b < 3; b++){
+    float ci = clamp(dot(-rd, n), 0.0, 1.0);
+    thr *= F0 + (1.0 - F0) * pow(1.0 - ci, 5.0);
+    rd = reflect(rd, n);
+    if (b >= maxB - 1){ return acc + thr * env(rd, blur); }
+    vec3 hp;
+    int kind = traceScene(p + n * 0.003, rd, hp);
+    if (kind == 1){ p = hp; n = calcNormal(p); blur += ROUGH_BLUR; continue; }
+    if (kind == 2) return acc + thr * (floorDirect(hp) + smoothstep(3.9, 4.1, hp.z) * glintDir(rd, blur));
+    return acc + thr * env(rd, blur);
+  }
+  return acc;
+}
+`;
+
+const SCENE_FRAG = /* glsl */`
+${GLSL_COMMON}
+uniform mat4 uProjInv;
+uniform mat4 uCamWorld;
+uniform vec3 uCamPos;
+uniform vec2 uRes;
+out vec4 fragColor;
+
+void main(){
+  vec2 ndc = gl_FragCoord.xy / uRes * 2.0 - 1.0;
+  vec4 v = uProjInv * vec4(ndc, 1.0, 1.0);
+  vec3 rd = normalize(mat3(uCamWorld) * normalize(v.xyz / v.w));
+  vec3 ro = uCamPos;
+  vec3 hp;
+  int kind = traceScene(ro, rd, hp);
+  vec3 col;
+  if (kind == 1){
+    col = shadeChrome(hp, calcNormal(hp), rd, 3);
+  } else if (kind == 2){
+    col = floorDirect(hp);
+    // 6% floor reflection
+    vec3 rr = reflect(rd, vec3(0.0, 1.0, 0.0));
+    vec3 hp2;
+    int k2 = traceScene(hp + vec3(0.0, 0.001, 0.0), rr, hp2);
+    vec3 refl = k2 == 1 ? shadeChrome(hp2, calcNormal(hp2), rr, 2) : env(rr, 2.0);
+    col += 0.06 * refl * (1.0 - smoothstep(3.9, 4.1, hp.z));
+    // far floor melts into the cyclorama
+    col = mix(col, env(vec3(rd.x, 0.0, rd.z) * inversesqrt(max(rd.x*rd.x + rd.z*rd.z, 1e-6)), 0.0), smoothstep(14.0, 60.0, length(hp.xz)));
+  } else {
+    col = env(rd, 0.0);
+  }
+  fragColor = vec4(col, 1.0);
+}
+`;
+
+const MESH_VERT = /* glsl */`
+precision highp float;
+uniform mat4 modelMatrix, viewMatrix, projectionMatrix;
+in vec3 position;
+in vec3 normal;
+out vec3 vWorld;
+out vec3 vNormal;
+void main(){
+  vec4 w = modelMatrix * vec4(position, 1.0);
+  vWorld = w.xyz;
+  vNormal = mat3(modelMatrix) * normal;
+  gl_Position = projectionMatrix * viewMatrix * w;
+}
+`;
+
+const MESH_FRAG = /* glsl */`
+${GLSL_COMMON}
+uniform vec3 cameraPosition;
+in vec3 vWorld;
+in vec3 vNormal;
+out vec4 fragColor;
+void main(){
+  vec3 rd = normalize(vWorld - cameraPosition);
+  vec3 n = normalize(vNormal);
+  if (dot(n, rd) > 0.0) n = -n;
+  fragColor = vec4(shadeChrome(vWorld, n, rd, 3), 1.0);
+}
+`;
+
+const QUAD_VERT = /* glsl */`
+in vec3 position;
+out vec2 vUv;
+void main(){ vUv = position.xy * 0.5 + 0.5; gl_Position = vec4(position.xy, 0.0, 1.0); }
+`;
+
+const BAKE_FRAG = /* glsl */`
+precision highp float;
+precision highp int;
+uniform sampler2D uSeg;
+uniform vec2 uTexMin, uTexSize, uBakeRes;
+uniform vec4 uGlyphBox[${NG}];
+uniform float uSegStart[${NG}];
+uniform float uSegCount[${NG}];
+uniform float uGlyphChan[${NG}];
+out vec4 fragColor;
+
+float glyphDist(int g, vec2 p){
+  vec4 b = uGlyphBox[g];
+  float bd = length(max(max(b.xy - p, p - b.zw), 0.0));
+  if (bd > 0.4) return bd;
+  int s0 = int(uSegStart[g]), n = int(uSegCount[g]);
+  float md = 1e9;
+  bool inside = false;
+  for (int j = 0; j < MAXSEG; j++){
+    if (j >= n) break;
+    int k = s0 + j;
+    vec4 sg = texelFetch(uSeg, ivec2(k % 1024, k / 1024), 0);
+    vec2 a = sg.xy, c = sg.zw;
+    vec2 pa = p - a, ba = c - a;
+    float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+    vec2 e = pa - ba * h;
+    md = min(md, dot(e, e));
+    if ((a.y > p.y) != (c.y > p.y)){
+      float xi = a.x + (p.y - a.y) * (c.x - a.x) / (c.y - a.y);
+      if (p.x < xi) inside = !inside;
+    }
+  }
+  float d = sqrt(md);
+  return inside ? -d : d;
+}
+
+void main(){
+  vec2 p = uTexMin + gl_FragCoord.xy / uBakeRes * uTexSize;
+  vec4 o = vec4(1000.0);
+  for (int g = 0; g < ${NG}; g++){
+    float d = glyphDist(g, p);
+    float ch = uGlyphChan[g];
+    if (ch < 0.5) o.r = min(o.r, d); else if (ch < 1.5) o.g = min(o.g, d); else o.b = min(o.b, d);
+    o.a = min(o.a, d);
+  }
+  fragColor = o;
+}
+`;
+
+const COMP_FRAG = /* glsl */`
+precision highp float;
+uniform sampler2D tScene, tMesh;
+uniform float uFade;
+in vec2 vUv;
+out vec4 fragColor;
+void main(){
+  vec3 s = texture(tScene, vUv).rgb;
+  vec4 m = texture(tMesh, vUv);
+  fragColor = vec4(mix(s, m.rgb, m.a * uFade), 1.0);
+}
+`;
+
+const DOWN_FRAG = /* glsl */`
+precision highp float;
+uniform sampler2D tSrc;
+uniform vec2 uSrcTexel;
+uniform float uThreshold;
+in vec2 vUv;
+out vec4 fragColor;
+vec3 tap(vec2 o){ vec3 c = texture(tSrc, vUv + o * uSrcTexel).rgb; return max(c - uThreshold, 0.0); }
+void main(){
+  vec3 c = tap(vec2(-1.0, -1.0)) + tap(vec2(1.0, -1.0)) + tap(vec2(-1.0, 1.0)) + tap(vec2(1.0, 1.0));
+  fragColor = vec4(0.25 * c, 1.0);
+}
+`;
+
+const UP_FRAG = /* glsl */`
+precision highp float;
+uniform sampler2D tSrc;
+uniform vec2 uSrcTexel;
+in vec2 vUv;
+out vec4 fragColor;
+void main(){
+  vec2 t = uSrcTexel;
+  vec3 c = texture(tSrc, vUv).rgb * 4.0;
+  c += (texture(tSrc, vUv + vec2(t.x, 0.0)).rgb + texture(tSrc, vUv - vec2(t.x, 0.0)).rgb +
+        texture(tSrc, vUv + vec2(0.0, t.y)).rgb + texture(tSrc, vUv - vec2(0.0, t.y)).rgb) * 2.0;
+  c += texture(tSrc, vUv + t).rgb + texture(tSrc, vUv - t).rgb +
+       texture(tSrc, vUv + vec2(t.x, -t.y)).rgb + texture(tSrc, vUv + vec2(-t.x, t.y)).rgb;
+  fragColor = vec4(c / 16.0, 1.0);
+}
+`;
+
+const FINAL_FRAG = /* glsl */`
+precision highp float;
+precision highp int;
+uniform sampler2D tHDR, tBloom;
+uniform float uBloomLevels;
+uniform float uFrame;
+uniform vec2 uRes;
+in vec2 vUv;
+out vec4 fragColor;
+
+// linear to 0.9, then a soft shoulder towards 1.0
+vec3 tone(vec3 x){
+  vec3 sh = 0.9 + 0.1 * (1.0 - exp(-(x - 0.9) / 0.1));
+  return mix(x, sh, step(0.9, x));
+}
+vec3 toSRGB(vec3 c){
+  c = clamp(c, 0.0, 1.0);
+  return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c));
+}
+uint pcg(uint v){
+  uint s = v * 747796405u + 2891336453u;
+  uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+  return (w >> 22u) ^ w;
+}
+void main(){
+  vec3 c = texture(tHDR, vUv).rgb;
+  c += 0.3 * texture(tBloom, vUv).rgb / uBloomLevels;   // bloom, threshold 1.0, strength 0.3
+  c = tone(c);
+  vec2 q = vUv * 2.0 - 1.0;
+  c *= 1.0 - 0.07 * clamp(dot(q, q) * 0.5, 0.0, 1.0);   // 7% vignette at the corners
+  c = toSRGB(c);
+  uvec2 fc = uvec2(gl_FragCoord.xy);
+  uint h = pcg(fc.x + pcg(fc.y + pcg(uint(uFrame))));
+  float g = float(h) * (1.0 / 4294967295.0);
+  c += (g - 0.5) * 0.03;                                  // 1.5% grain, seeded by frame index
+  fragColor = vec4(c, 1.0);
+}
+`;
+
+// ---------------------------------------------------------------------------
+// Renderer and targets
+// ---------------------------------------------------------------------------
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, alpha: false, preserveDrawingBuffer: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(1);
+renderer.setSize(W, H, false);
+renderer.autoClear = false;
+
+const rtOpts = { type: THREE.HalfFloatType, format: THREE.RGBAFormat, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false, generateMipmaps: false };
+const rtScene = new THREE.WebGLRenderTarget(W, H, rtOpts);
+const rtMesh = new THREE.WebGLRenderTarget(W, H, { ...rtOpts, depthBuffer: true });
+const rtHDR = new THREE.WebGLRenderTarget(W, H, rtOpts);
+const bloomLevels = [];
+for (let i = 0, w = W >> 1, h = H >> 1; i < 5; i++, w = Math.max(1, w >> 1), h = Math.max(1, h >> 1)) {
+  bloomLevels.push(new THREE.WebGLRenderTarget(w, h, rtOpts));
+}
+
+const quadGeo = new THREE.BufferGeometry();
+quadGeo.setAttribute('position', new THREE.Float32BufferAttribute([-1, -1, 0, 3, -1, 0, -1, 3, 0], 3));
+const quad = new THREE.Mesh(quadGeo);
+quad.frustumCulled = false;
+const quadScene = new THREE.Scene();
+quadScene.add(quad);
+const quadCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+const rawMat = (frag, uniforms, extra = {}) => new THREE.RawShaderMaterial({
+  glslVersion: THREE.GLSL3, vertexShader: QUAD_VERT, fragmentShader: frag, uniforms,
+  depthTest: false, depthWrite: false, ...extra,
+});
+function pass(material, target) {
+  quad.material = material;
+  renderer.setRenderTarget(target);
+  renderer.render(quadScene, quadCam);
+}
+
+// ---------------------------------------------------------------------------
+// Text layout: per-glyph outlines, tracking, optically centred period
+// ---------------------------------------------------------------------------
+function contourBox(contours, ox = 0, oy = 0) {
+  const b = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
+  for (const c of contours) for (const p of c) {
+    b.x0 = Math.min(b.x0, p.x + ox); b.x1 = Math.max(b.x1, p.x + ox);
+    b.y0 = Math.min(b.y0, p.y + oy); b.y1 = Math.max(b.y1, p.y + oy);
+  }
+  return b;
+}
+// horizontal ink extent of a glyph inside a y band, sampling every edge densely
+function inkExtentInBand(g, y0, y1, side) {
+  let best = side > 0 ? -Infinity : Infinity;
+  for (const c of g.contours) for (let k = 0; k < c.length; k++) {
+    const a = c[k], b = c[(k + 1) % c.length];
+    for (let s = 0; s <= 8; s++) {
+      const x = lerp(a.x, b.x, s / 8), y = lerp(a.y, b.y, s / 8);
+      if (y < y0 || y > y1) continue;
+      best = side > 0 ? Math.max(best, x + g.ox) : Math.min(best, x + g.ox);
+    }
+  }
+  return best;
+}
+
+function layoutText(font) {
+  const scale = SIZE / font.data.resolution;
+  const glyphs = [];
+  let x = 0;
+  for (const ch of TEXT) {
+    const gd = font.data.glyphs[ch];
+    if (ch !== ' ') {
+      const shapes = font.generateShapes(ch, SIZE);
+      const contours = [];
+      let area = 0;
+      for (const s of shapes) {
+        const { shape, holes } = s.extractPoints(CURVE_SEGS);
+        contours.push(shape, ...holes);
+        area += Math.abs(THREE.ShapeUtils.area(shape));
+        for (const h of holes) area -= Math.abs(THREE.ShapeUtils.area(h));
+      }
+      glyphs.push({ ch, ox: x, oy: 0, contours, area });
+    }
+    x += gd.ha * scale + TRACKING;
+  }
+  // optically centre each period between its neighbours, measured at the period's own height
+  for (let i = 1; i < glyphs.length - 1; i++) {
+    const g = glyphs[i];
+    if (g.ch !== '.') continue;
+    const pb = contourBox(g.contours, g.ox);
+    const band0 = pb.y0 - 0.01, band1 = pb.y1 + 0.03;
+    const right = inkExtentInBand(glyphs[i - 1], band0, band1, +1);
+    const left = inkExtentInBand(glyphs[i + 1], band0, band1, -1);
+    g.ox += (right + left) / 2 - (pb.x0 + pb.x1) / 2;
+  }
+  // centre the line on its ink box
+  const all = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
+  for (const g of glyphs) {
+    const b = contourBox(g.contours, g.ox, g.oy);
+    all.x0 = Math.min(all.x0, b.x0); all.x1 = Math.max(all.x1, b.x1);
+    all.y0 = Math.min(all.y0, b.y0); all.y1 = Math.max(all.y1, b.y1);
+  }
+  const dx = -(all.x0 + all.x1) / 2, dy = -(all.y0 + all.y1) / 2;
+  const maxArea = Math.max(...glyphs.map(g => g.area));
+  glyphs.forEach((g, i) => {
+    g.ox += dx; g.oy += dy;
+    g.box = contourBox(g.contours, g.ox, g.oy);
+    g.center = new THREE.Vector3((g.box.x0 + g.box.x1) / 2, (g.box.y0 + g.box.y1) / 2, 0);
+    g.dropR = Math.max(0.06, 0.19 * Math.pow(g.area / maxArea, 0.4));   // droplet sized by glyph area
+    g.chan = i % 3;
+  });
+  return glyphs;
+}
+
+// ---------------------------------------------------------------------------
+// Signed distance bake on the GPU: 2048 x 512, glyph i in channel i % 3, union in alpha
+// ---------------------------------------------------------------------------
+function bakeSDF(glyphs) {
+  const segs = [], starts = [], counts = [];
+  for (const g of glyphs) {
+    starts.push(segs.length / 4);
+    for (const c of g.contours) for (let k = 0; k < c.length; k++) {
+      const a = c[k], b = c[(k + 1) % c.length];
+      if (Math.hypot(b.x - a.x, b.y - a.y) < 1e-7) continue;
+      segs.push(a.x + g.ox, a.y + g.oy, b.x + g.ox, b.y + g.oy);
+    }
+    counts.push(segs.length / 4 - starts[starts.length - 1]);
+  }
+  const n = segs.length / 4, rows = Math.ceil(n / 1024);
+  const data = new Float32Array(1024 * rows * 4);
+  data.set(segs);
+  const segTex = new THREE.DataTexture(data, 1024, rows, THREE.RGBAFormat, THREE.FloatType);
+  segTex.needsUpdate = true;
+
+  // bake domain: every glyph region plus slack, at the texture's 4:1 aspect
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  for (const g of glyphs) {
+    x0 = Math.min(x0, g.box.x0); x1 = Math.max(x1, g.box.x1);
+    y0 = Math.min(y0, g.box.y0); y1 = Math.max(y1, g.box.y1);
+  }
+  const pad = GLYPH_MARGIN + 0.04;
+  let w = x1 - x0 + 2 * pad, h = y1 - y0 + 2 * pad;
+  if (w / h > BAKE_W / BAKE_H) h = w * BAKE_H / BAKE_W; else w = h * BAKE_W / BAKE_H;
+  const texMin = new THREE.Vector2((x0 + x1) / 2 - w / 2, (y0 + y1) / 2 - h / 2);
+  const texSize = new THREE.Vector2(w, h);
+
+  const rt = new THREE.WebGLRenderTarget(BAKE_W, BAKE_H, rtOpts);
+  const mat = rawMat(BAKE_FRAG, {
+    uSeg: { value: segTex },
+    uTexMin: { value: texMin }, uTexSize: { value: texSize },
+    uBakeRes: { value: new THREE.Vector2(BAKE_W, BAKE_H) },
+    uGlyphBox: { value: glyphs.map(g => new THREE.Vector4(g.box.x0, g.box.y0, g.box.x1, g.box.y1)) },
+    uSegStart: { value: starts }, uSegCount: { value: counts },
+    uGlyphChan: { value: glyphs.map(g => g.chan) },
+  });
+  mat.defines = { MAXSEG: Math.max(...counts) };
+  pass(mat, rt);
+  mat.dispose(); segTex.dispose();
+  return { texture: rt.texture, texMin, texSize };
+}
+
+// ---------------------------------------------------------------------------
+// Real mesh: TextGeometry per glyph, creased normals at 35 degrees
+// ---------------------------------------------------------------------------
+function buildMesh(font, glyphs, material) {
+  const geos = glyphs.map(g => {
+    const geo = new TextGeometry(g.ch, {
+      font, size: SIZE, height: HEIGHT, curveSegments: CURVE_SEGS,
+      bevelEnabled: true, bevelThickness: BEVEL, bevelSize: BEVEL, bevelOffset: 0, bevelSegments: BEVEL_SEGS,
+    });
+    geo.translate(g.ox, g.oy, -HEIGHT / 2);
+    // crease caps (group 0) and sides/bevels (group 1) separately so the flat caps
+    // are not averaged with the first bevel ring and stay truly planar
+    const pos = geo.attributes.position.array;
+    const parts = geo.groups.map(({ start, count }) => {
+      const part = new THREE.BufferGeometry();
+      part.setAttribute('position', new THREE.Float32BufferAttribute(pos.slice(start * 3, (start + count) * 3), 3));
+      return toCreasedNormals(part, CREASE);
+    });
+    geo.dispose();
+    return mergeGeometries(parts);
+  });
+  const mesh = new THREE.Mesh(mergeGeometries(geos), material);
+  mesh.frustumCulled = false;
+  return mesh;
+}
+
+// ---------------------------------------------------------------------------
+// Timeline: everything is a pure function of t (mod 6 s)
+// ---------------------------------------------------------------------------
+function slumpAt(tm) { return tm >= 4.9 ? 0.12 * s5step(4.9, 5.2, tm) : 0; }
+
+function dropPos(g, i, tm, out) {
+  if (tm >= 5.0) {
+    // drain to the centre with ease-in, arriving as the blob reforms at 5.62
+    const x = clamp01((tm - 5.05) / (5.62 - 5.05));
+    out.set(g.center.x, g.center.y - slumpAt(tm), 0).lerp(new THREE.Vector3(0, 0, 0), x * x * x);
+    return g.dropR * (1 - sstep(5.6, 5.72, tm));
+  }
+  if (tm >= 1.4) {
+    // pinch out of the stretched blob, arc 0.2 up to the glyph, overshoot 7%
+    const u = backOut(clamp01((tm - 1.6) / 0.5), BACK_C);
+    const sx = g.center.x * 0.78 * lerp(0.4, 1, s5step(1.4, 1.85, tm));   // ride the blob's stretch
+    out.set(lerp(sx, g.center.x, u), lerp(0, g.center.y, u) + 0.2 * Math.sin(Math.PI * clamp01(u)), 0);
+    return g.dropR * sstep(1.42, 1.8, tm);
+  }
+  out.set(0, 0, 0);
+  return 0;
+}
+
+function blobAt(tm, U) {
+  const present = tm >= 5.3 || tm < 2.1;
+  if (!present) { U.uBlobR.value.set(0, 0, 0); U.uNoiseAmp.value = 0; return; }
+  const grow = tm >= 5.3 ? easeOut3((tm - 5.3) / 0.32) : 1;
+  const bw = tm < 3 ? 1 - sstep(1.1, 1.3, tm) : sstep(5.62, 5.95, tm);
+  let r = BLOB_R * grow * (1 + 0.03 * bw * Math.sin(2 * Math.PI * tm / 1.5));
+  let sx = 1, sy = 1, sz = 1;
+  // merge wobble: three bounces, 14%, damping ratio 0.25, running through frame 0
+  const tw = mod(tm - 5.62, LOOP);
+  if (tw < 1.0) {
+    const zeta = 0.25, wd = 2 * Math.PI / 0.3, wn = wd / Math.sqrt(1 - zeta * zeta);
+    const w = 0.14 * Math.exp(-zeta * wn * tw) * Math.sin(wd * tw) / Math.exp(-zeta * wn * 0.075) * (1 - sstep(0.75, 1.0, tw));
+    sy *= 1 - w; sx *= 1 + 0.5 * w; sz *= 1 + 0.5 * w;
+  }
+  if (tm < 3) {
+    // squash 10%, then stretch 2.4x wide and pinch away
+    const sq = sstep(1.2, 1.4, tm) - sstep(1.4, 1.6, tm);
+    sy *= 1 - 0.10 * sq; sx *= 1 + 0.05 * sq; sz *= 1 + 0.05 * sq;
+    const st = s5step(1.4, 1.85, tm);
+    sx *= lerp(1, 2.4, st); sy *= lerp(1, 0.55, st); sz *= lerp(1, 0.6, st);
+    const pf = sstep(1.62, 2.1, tm);
+    sy *= 1 - pf; sz *= 1 - pf; sx *= 1 - 0.35 * pf;
+  }
+  const lim = v => Math.max(v, 1e-3);
+  U.uBlobR.value.set(lim(r * sx), lim(r * sy), lim(r * sz));
+  U.uBlobC.value.set(0, 0, 0);
+  U.uNoiseAmp.value = 0.05 * grow * (tm < 3 ? 1 - sstep(1.4, 1.9, tm) : 1);
+  const th = 2 * Math.PI * tm / LOOP;
+  U.uNoiseOfs.value.set(0.9 * Math.cos(th), 0.9 * Math.sin(th));
+}
+
+function smoothKAt(tm) {
+  if (tm < 1.4) return 0.35;
+  if (tm < 2.1) return lerp(0.35, 0.1, sstep(1.4, 2.1, tm));
+  if (tm < 5.05) return 0.1;
+  return lerp(0.1, 0.35, sstep(5.05, 5.5, tm));
+}
+
+function cameraAt(tm, camera) {
+  let d;
+  if (tm < 2.6) d = lerp(5.6, 7.2, s5step(0, 2.6, tm));
+  else if (tm < 2.9) d = 7.2;
+  else if (tm < 4.8) d = lerp(7.2, 6.95, s5step(2.9, 4.8, tm));
+  else d = lerp(6.95, 5.6, s5step(4.8, 5.9, tm));
+  const az = ORBIT * Math.sin(2 * Math.PI * (tm - 3.85) / LOOP);   // centred on the hold
+  camera.position.set(
+    TARGET.x + d * Math.sin(az) * Math.cos(ELEV),
+    TARGET.y + d * Math.sin(ELEV),
+    TARGET.z + d * Math.cos(az) * Math.cos(ELEV));
+  camera.lookAt(TARGET);
+}
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+async function init() {
+  const font = await new FontLoader().loadAsync(FONT_URL);
+  const glyphs = layoutText(font);
+  const bake = bakeSDF(glyphs);
+
+  const U = {
+    uSdfTex: { value: bake.texture },
+    uTexMin: { value: bake.texMin }, uTexSize: { value: bake.texSize },
+    uGlyphBox: { value: glyphs.map(g => new THREE.Vector4(g.box.x0, g.box.y0, g.box.x1, g.box.y1)) },
+    uGlyphChan: { value: glyphs.map(g => g.chan) },
+    uDropC: { value: glyphs.map(() => new THREE.Vector3()) },
+    uDropAxis: { value: glyphs.map(() => new THREE.Vector3(0, 1, 0)) },
+    uDropR: { value: glyphs.map(() => new THREE.Vector2()) },
+    uK: { value: new Float32Array(NG) },
+    uBev: { value: new Float32Array(NG) },
+    uSmk: { value: new Float32Array(NG) },
+    uInfl: { value: 0 }, uSlump: { value: 0 },
+    uBlobC: { value: new THREE.Vector3() }, uBlobR: { value: new THREE.Vector3() },
+    uNoiseAmp: { value: 0 }, uNoiseOfs: { value: new THREE.Vector2() },
+    uGlintAz: { value: 0 }, uGlintAmt: { value: 0 },
+    uProjInv: { value: new THREE.Matrix4() }, uCamWorld: { value: new THREE.Matrix4() },
+    uCamPos: { value: new THREE.Vector3() }, uRes: { value: new THREE.Vector2(W, H) },
+  };
+
+  const sceneMat = rawMat(SCENE_FRAG, U);
+  const meshMat = new THREE.RawShaderMaterial({ glslVersion: THREE.GLSL3, vertexShader: MESH_VERT, fragmentShader: MESH_FRAG, uniforms: U });
+  const meshScene = new THREE.Scene();
+  meshScene.add(buildMesh(font, glyphs, meshMat));
+  const camera = new THREE.PerspectiveCamera(FOV, W / H, 0.05, 100);
+
+  const compMat = rawMat(COMP_FRAG, { tScene: { value: rtScene.texture }, tMesh: { value: rtMesh.texture }, uFade: { value: 0 } });
+  const downMat = rawMat(DOWN_FRAG, { tSrc: { value: null }, uSrcTexel: { value: new THREE.Vector2() }, uThreshold: { value: 0 } });
+  const upMat = rawMat(UP_FRAG, { tSrc: { value: null }, uSrcTexel: { value: new THREE.Vector2() } }, { blending: THREE.CustomBlending, blendEquation: THREE.AddEquation, blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor });
+  const finalMat = rawMat(FINAL_FRAG, {
+    tHDR: { value: rtHDR.texture }, tBloom: { value: bloomLevels[0].texture },
+    uBloomLevels: { value: bloomLevels.length }, uFrame: { value: 0 }, uRes: { value: new THREE.Vector2(W, H) },
+  });
+
+  const tmpA = new THREE.Vector3(), tmpB = new THREE.Vector3(), tmpC = new THREE.Vector3();
+
+  function renderAt(t) {
+    t = Number(t) || 0;
+    const tm = mod(t, LOOP);
+    const frame = Math.floor(mod(t * FPS + 1e-3, LOOP * FPS));
+    const jit = JITTER[Math.floor(mod(t * FPS + 1e-4, 1) * 4) & 3];
+
+    // --- blob, droplets, glyphs ---
+    blobAt(tm, U);
+    const kG = smoothKAt(tm);
+    const slump = slumpAt(tm);
+    U.uSlump.value = slump;
+    U.uInfl.value = tm >= 4.8 ? 0.022 * sstep(4.8, 4.8 + 6 / FPS, tm) : 0;   // 6-frame swell
+    glyphs.forEach((g, i) => {
+      const h = 1 / 600;
+      const r = dropPos(g, i, tm, tmpA);
+      dropPos(g, i, tm + h, tmpB);
+      dropPos(g, i, tm - h, tmpC);
+      const vel = tmpB.sub(tmpC).divideScalar(2 * h);
+      const speed = vel.length();
+      const s = 1 + Math.min(0.7, speed * 0.25);          // stretch along velocity
+      U.uDropC.value[i].copy(tmpA);
+      if (speed > 1e-3) U.uDropAxis.value[i].copy(vel).normalize(); else U.uDropAxis.value[i].set(0, 1, 0);
+      U.uDropR.value[i].set(r * s, r / Math.sqrt(s));
+
+      // droplets become letters left to right, 3 frames apart, 0.4 s each
+      const m0 = 2.2 + i * 3 / FPS;
+      let K = tm < 5.0 ? s5step(m0, m0 + 0.4, tm) : 1 - s5step(5.0, 5.3, tm);
+      if (tm < 2.0) K = 0;
+      U.uK.value[i] = K;
+      // bevel starts 0.07 puffy and springs flat to 0.03; softens on the slump
+      const tau = tm - m0;
+      let bev = tau <= 0 ? 0.07 : BEVEL + 0.04 * Math.exp(-tau / 0.13) * Math.cos(2 * Math.PI * tau / 0.36);
+      bev = Math.max(0.006, bev) + 0.05 * (tm >= 4.9 ? sstep(4.9, 5.15, tm) : 0);
+      U.uBev.value[i] = bev;
+      U.uSmk.value[i] = kG * (1 - K);
+    });
+
+    // --- glint sweep, 3.3 to 4.1 s ---
+    const gs = clamp01((tm - 3.3) / 0.8);
+    U.uGlintAz.value = lerp(-28, 28, gs * gs * (3 - 2 * gs)) * Math.PI / 180;
+    U.uGlintAmt.value = (tm > 3.3 && tm < 4.1) ? sstep(3.3, 3.36, tm) * (1 - sstep(4.04, 4.1, tm)) : 0;
+
+    // --- camera with quarter-pixel jitter ---
+    cameraAt(tm, camera);
+    camera.updateMatrixWorld();
+    camera.updateProjectionMatrix();
+    camera.projectionMatrix.elements[8] += 2 * jit[0] / W;
+    camera.projectionMatrix.elements[9] += 2 * jit[1] / H;
+    camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+    U.uProjInv.value.copy(camera.projectionMatrixInverse);
+    U.uCamWorld.value.copy(camera.matrixWorld);
+    U.uCamPos.value.copy(camera.position);
+
+    // --- SDF pass ---
+    pass(sceneMat, rtScene);
+
+    // --- real mesh, cross-faded in for the hold (3.3 to 4.7 s) ---
+    const fade = sstep(3.3, 3.5, tm) * (1 - sstep(4.5, 4.7, tm));
+    compMat.uniforms.uFade.value = fade;
+    renderer.setRenderTarget(rtMesh);
+    renderer.setClearColor(0x000000, 0);
+    renderer.clear(true, true, false);
+    if (fade > 0) renderer.render(meshScene, camera);
+    pass(compMat, rtHDR);
+
+    // --- bloom: threshold 1.0 ---
+    let src = rtHDR;
+    bloomLevels.forEach((lvl, i) => {
+      downMat.uniforms.tSrc.value = src.texture;
+      downMat.uniforms.uSrcTexel.value.set(1 / src.width, 1 / src.height);
+      downMat.uniforms.uThreshold.value = i === 0 ? 1.0 : 0.0;
+      pass(downMat, lvl);
+      src = lvl;
+    });
+    for (let i = bloomLevels.length - 1; i > 0; i--) {
+      upMat.uniforms.tSrc.value = bloomLevels[i].texture;
+      upMat.uniforms.uSrcTexel.value.set(1 / bloomLevels[i].width, 1 / bloomLevels[i].height);
+      pass(upMat, bloomLevels[i - 1]);
+    }
+
+    // --- tone, vignette, grain to the canvas ---
+    finalMat.uniforms.uFrame.value = frame;
+    pass(finalMat, null);
+  }
+
+  window.renderAt = renderAt;
+  return renderAt;
+}
+
+const params = new URLSearchParams(location.search);
+init().then(renderAt => {
+  if (params.has('t')) {
+    renderAt(parseFloat(params.get('t')) || 0);
+    window.__ready = true;
+  } else {
+    window.__ready = true;
+    const start = performance.now();
+    const loop = now => { renderAt(((now - start) / 1000) % LOOP); requestAnimationFrame(loop); };
+    requestAnimationFrame(loop);
+  }
+}).catch(err => { console.error(err); window.__error = String(err && err.stack || err); });
+</script>
+</body>
+</html>
